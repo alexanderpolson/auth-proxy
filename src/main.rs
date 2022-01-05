@@ -7,13 +7,14 @@ use hyper_tls::HttpsConnector;
 use std::time::{Duration, SystemTime};
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_sig_auth::middleware::Signature;
-use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError};
+use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError, SignableBody};
 use aws_smithy_http::body::SdkBody;
 use aws_types::SigningService;
 use aws_types::credentials::ProvideCredentials;
 use aws_types::region::SigningRegion;
 use http_body::Body as HttpBody;
 use hyper::body::Bytes;
+use std::str;
 
 fn get_path_and_query(path_and_query: Option<&PathAndQuery>) -> PathAndQuery {
     match path_and_query {
@@ -23,13 +24,17 @@ fn get_path_and_query(path_and_query: Option<&PathAndQuery>) -> PathAndQuery {
 }
 
 async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    println!("Original Request:");
+    log_request(&request);
+    println!();
+
     // Assuming secure connection for now.
     let https = HttpsConnector::new();
     let client = Client::builder().build::<_, SdkBody>(https);
     let path_and_query = request.uri().path_and_query();
 
     // TODO: Make this configurable.
-    let host = "www.google.com";
+    let host = "s3.us-west-2.amazonaws.com";
     let url = hyper::Uri::builder()
         .scheme(Scheme::HTTPS)
         .authority(Authority::from_static(host))
@@ -43,30 +48,36 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     // Pass on the headers
     for (name, value) in request.headers() {
         if name.as_str() == "host" {
-            new_request_builder = new_request_builder.header(name, host);
+            // new_request_builder = new_request_builder.header(name, host);
         } else {
             new_request_builder = new_request_builder.header(name, value);
         }
     }
 
     // https://users.rust-lang.org/t/read-hyper-body-without-modification-to-it/45446/6
-    let buffer: Bytes = {
-        let mut body = request.into_body();
-        let mut buf = BytesMut::with_capacity(body.size_hint().lower() as usize);
-        while let Some(chunk) = body.data().await {
-            buf.extend_from_slice(&chunk?);
-        }
-        buf.freeze()
-    };
+    let mut original_body = request.into_body();
+    let buffer = body_to_bytes(&mut original_body);
+
     // Sign the request.
     // https://docs.rs/aws-sig-auth/latest/aws_sig_auth/
-    let sdk_body: SdkBody = SdkBody::from(buffer);
+    let sdk_body: SdkBody = SdkBody::from(buffer.await);
     let mut new_request = new_request_builder.body(sdk_body).unwrap();
     sign_request(&mut new_request).await.unwrap();
+
+    println!("Updated Request:");
     log_request(&new_request);
-    let response = client.request(new_request).await;
-    log_response(&response);
+    println!();
+    let mut response = client.request(new_request).await;
+    log_response(&mut response).await;
     response
+}
+
+async fn body_to_bytes(body: &mut Body) -> Bytes {
+    let mut buf = BytesMut::with_capacity(body.size_hint().lower() as usize);
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    buf.freeze()
 }
 
 async fn sign_request(request: &mut Request<SdkBody>) -> Result<Signature, SigningError> {
@@ -78,18 +89,19 @@ async fn sign_request(request: &mut Request<SdkBody>) -> Result<Signature, Signi
     let signer = signer::SigV4Signer::new();
     let mut operation_config = OperationSigningConfig::default_config();
     operation_config.signature_type = HttpSignatureType::HttpRequestHeaders;
-    operation_config.expires_in = Some(Duration::from_secs(15));
+    // operation_config.signature_type = HttpSignatureType::HttpRequestQueryParams;
+    operation_config.expires_in = Some(Duration::from_secs(15 * 60));
     let request_config = RequestConfig {
         request_ts: SystemTime::now(),
         region: &SigningRegion::from_static("us-west-2"),
-        service: &SigningService::from_static(""),
-        payload_override: None,
+        service: &SigningService::from_static("s3"),
+        payload_override: Some(&SignableBody::UnsignedPayload),
     };
 
     signer.sign(&operation_config, &request_config, &credentials, request)
 }
 
-fn log_request(request: &Request<SdkBody>) {
+fn log_request<T: HttpBody>(request: &Request<T>) {
     println!("Method: {}", request.method());
     println!("URI: {}", request.uri());
     for (name, value) in request.headers() {
@@ -97,10 +109,11 @@ fn log_request(request: &Request<SdkBody>) {
     }
 }
 
-fn log_response(result: &Result<Response<Body>, hyper::Error>) {
+async fn log_response(result: &mut Result<Response<Body>, hyper::Error>) {
     match result {
         Ok(response) => {
             println!("Status: {}", response.status());
+            println!("Body: {}", str::from_utf8(&body_to_bytes(&mut response.body_mut()).await).unwrap());
         },
         Err(err) => {
             println!("Error: {}", err);
@@ -121,7 +134,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         async { Ok::<_, hyper::Error>(service_fn(hello)) }
     });
 
-    let addr = ([127, 0, 0, 1], 3000).into();
+    let addr = ([127, 0, 0, 1], 8123).into();
 
     let server = Server::bind(&addr).serve(make_svc);
 

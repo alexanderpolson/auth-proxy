@@ -7,7 +7,7 @@ use hyper_tls::HttpsConnector;
 use std::time::{Duration, SystemTime};
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_sig_auth::middleware::Signature;
-use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError, SignableBody};
+use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError, SignableBody, SigningRequirements, SigningAlgorithm};
 use aws_smithy_http::body::SdkBody;
 use aws_types::SigningService;
 use aws_types::credentials::ProvideCredentials;
@@ -34,7 +34,7 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     let path_and_query = request.uri().path_and_query();
 
     // TODO: Make this configurable.
-    let host = "s3.us-west-2.amazonaws.com";
+    let host = "orbital-rust-registry.s3.amazonaws.com";
     let url = hyper::Uri::builder()
         .scheme(Scheme::HTTPS)
         .authority(Authority::from_static(host))
@@ -48,25 +48,36 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     // Pass on the headers
     for (name, value) in request.headers() {
         if name.as_str() == "host" {
-            // new_request_builder = new_request_builder.header(name, host);
-        } else {
+            new_request_builder = new_request_builder.header(name, host);
+        } else if name.as_str() == "x-amz-content-sha256" || name.as_str() == "x-amz-date" {
             new_request_builder = new_request_builder.header(name, value);
+        } else {
+            // TODO: Track other headers and add them back after signing.
         }
     }
 
     // https://users.rust-lang.org/t/read-hyper-body-without-modification-to-it/45446/6
     let mut original_body = request.into_body();
-    let buffer = body_to_bytes(&mut original_body);
+    let buffer = body_to_bytes(&mut original_body).await;
 
+    println!("Body length: {}", buffer.len());
     // Sign the request.
     // https://docs.rs/aws-sig-auth/latest/aws_sig_auth/
-    let sdk_body: SdkBody = SdkBody::from(buffer.await);
+    let sdk_body = if buffer.is_empty() {
+        SdkBody::empty()
+    } else {
+        SdkBody::from(buffer)
+    };
     let mut new_request = new_request_builder.body(sdk_body).unwrap();
-    sign_request(&mut new_request).await.unwrap();
 
     println!("Updated Request:");
     log_request(&new_request);
+    sign_request(&mut new_request).await.unwrap();
+
+    println!("Signed Request:");
+    log_request(&new_request);
     println!();
+
     let mut response = client.request(new_request).await;
     log_response(&mut response).await;
     response
@@ -89,13 +100,15 @@ async fn sign_request(request: &mut Request<SdkBody>) -> Result<Signature, Signi
     let signer = signer::SigV4Signer::new();
     let mut operation_config = OperationSigningConfig::default_config();
     operation_config.signature_type = HttpSignatureType::HttpRequestHeaders;
-    // operation_config.signature_type = HttpSignatureType::HttpRequestQueryParams;
+    operation_config.signing_options.content_sha256_header = true;
+    operation_config.signing_requirements = SigningRequirements::Required;
     operation_config.expires_in = Some(Duration::from_secs(15 * 60));
+    operation_config.algorithm = SigningAlgorithm::SigV4;
     let request_config = RequestConfig {
         request_ts: SystemTime::now(),
         region: &SigningRegion::from_static("us-west-2"),
         service: &SigningService::from_static("s3"),
-        payload_override: Some(&SignableBody::UnsignedPayload),
+        payload_override: None,
     };
 
     signer.sign(&operation_config, &request_config, &credentials, request)
@@ -113,7 +126,7 @@ async fn log_response(result: &mut Result<Response<Body>, hyper::Error>) {
     match result {
         Ok(response) => {
             println!("Status: {}", response.status());
-            println!("Body: {}", str::from_utf8(&body_to_bytes(&mut response.body_mut()).await).unwrap());
+            // println!("Body: {}", str::from_utf8(&body_to_bytes(&mut response.body_mut()).await).unwrap());
         },
         Err(err) => {
             println!("Error: {}", err);

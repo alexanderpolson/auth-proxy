@@ -7,14 +7,14 @@ use hyper_tls::HttpsConnector;
 use std::time::{Duration, SystemTime};
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_sig_auth::middleware::Signature;
-use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError, SignableBody, SigningRequirements, SigningAlgorithm};
+use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError, SigningRequirements, SigningAlgorithm};
 use aws_smithy_http::body::SdkBody;
 use aws_types::SigningService;
 use aws_types::credentials::ProvideCredentials;
 use aws_types::region::SigningRegion;
 use http_body::Body as HttpBody;
 use hyper::body::Bytes;
-use std::str;
+use std::collections::HashMap;
 
 fn get_path_and_query(path_and_query: Option<&PathAndQuery>) -> PathAndQuery {
     match path_and_query {
@@ -46,13 +46,17 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
         .uri(url.unwrap());
 
     // Pass on the headers
+    let mut other_headers = HashMap::new();
     for (name, value) in request.headers() {
         if name.as_str() == "host" {
             new_request_builder = new_request_builder.header(name, host);
         } else if name.as_str() == "x-amz-content-sha256" || name.as_str() == "x-amz-date" {
             new_request_builder = new_request_builder.header(name, value);
         } else {
-            // TODO: Track other headers and add them back after signing.
+            // Track other headers and add them back after signing so as not to break the signing
+            // process. If we include these when signing, requests that are made are rejected because
+            // the produced signatures don't match.
+            other_headers.insert(name.clone(), value.clone());
         }
     }
 
@@ -74,6 +78,10 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     log_request(&new_request);
     sign_request(&mut new_request).await.unwrap();
 
+    for (name, value) in other_headers {
+        new_request.headers_mut().insert(name, value);
+    }
+
     println!("Signed Request:");
     log_request(&new_request);
     println!();
@@ -93,6 +101,7 @@ async fn body_to_bytes(body: &mut Body) -> Bytes {
 
 async fn sign_request(request: &mut Request<SdkBody>) -> Result<Signature, SigningError> {
     // Get credentials.
+    // TODO: Customize this.
     let credentials_provider = ProfileFileCredentialsProvider::builder()
         .profile_name("orbitalCode")
         .build();
@@ -126,7 +135,6 @@ async fn log_response(result: &mut Result<Response<Body>, hyper::Error>) {
     match result {
         Ok(response) => {
             println!("Status: {}", response.status());
-            // println!("Body: {}", str::from_utf8(&body_to_bytes(&mut response.body_mut()).await).unwrap());
         },
         Err(err) => {
             println!("Error: {}", err);

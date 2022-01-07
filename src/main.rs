@@ -1,10 +1,3 @@
-use bytes::BytesMut;
-use http::uri::PathAndQuery;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Request, Response, Server};
-use hyper::http::uri::{Authority, Scheme};
-use hyper_tls::HttpsConnector;
-use std::time::{Duration, SystemTime};
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_sig_auth::middleware::Signature;
 use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError, SigningRequirements, SigningAlgorithm};
@@ -12,83 +5,154 @@ use aws_smithy_http::body::SdkBody;
 use aws_types::SigningService;
 use aws_types::credentials::ProvideCredentials;
 use aws_types::region::SigningRegion;
-use http_body::Body as HttpBody;
-use hyper::body::Bytes;
-use std::collections::HashMap;
 
-fn get_path_and_query(path_and_query: Option<&PathAndQuery>) -> PathAndQuery {
-    match path_and_query {
-        Some(path_and_query) => path_and_query.clone(),
-        None => PathAndQuery::from_static("/")
+use bytes::BytesMut;
+
+use http_body::Body as HttpBody;
+
+use hyper::{Body, Client, Request, Response, Server};
+use hyper::http::uri::Scheme;
+use hyper::service::{make_service_fn, service_fn};
+use hyper_tls::HttpsConnector;
+use hyper::body::Bytes;
+
+use regex::Regex;
+
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+use http::StatusCode;
+
+struct ProxyProfile {
+    path_pattern: Regex,
+    destination_host: String,
+    destination_service: SigningService
+}
+
+struct ProxyProfileMatcher {
+    proxy_profiles: Vec<ProxyProfile>
+}
+
+// TODO: Add all supported services here.
+const SUPPORTED_SERVICES: [&'static str; 1] = ["s3"];
+
+// This is necessary because creating a SigningService requires a &'static str.
+fn signing_service(service_name: &str) -> Option<SigningService> {
+    for supported_service in SUPPORTED_SERVICES {
+        if service_name == supported_service {
+            return Some(SigningService::from_static(supported_service));
+        }
+    }
+    None
+}
+
+impl ProxyProfileMatcher {
+    fn new() -> ProxyProfileMatcher {
+        // TODO: Load these dynamically
+
+        ProxyProfileMatcher {
+            proxy_profiles: vec![ProxyProfile {
+                path_pattern: Regex::new(r"^/api/v1/crates/.+").unwrap(),
+                destination_host: String::from("orbital-rust-registry.s3.amazonaws.com"),
+                destination_service: signing_service("s3").unwrap(),
+            }]
+        }
+    }
+
+    fn get_matching_profile(self, request: &Request<Body>) -> Option<ProxyProfile> {
+        let path_and_query = request.uri().path_and_query();
+        match path_and_query {
+            Some(path_and_query) => {
+                for proxy_profile in self.proxy_profiles {
+                    if proxy_profile.path_pattern.is_match(path_and_query.path()) {
+                        return Some(proxy_profile);
+                    }
+                }
+                None
+            },
+            None => None
+        }
     }
 }
 
+// TODO: Initialize global state appropriately
 async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     println!("Original Request:");
     log_request(&request);
     println!();
 
-    // Assuming secure connection for now.
-    let https = HttpsConnector::new();
-    let client = Client::builder().build::<_, SdkBody>(https);
-    let path_and_query = request.uri().path_and_query();
+    // TODO: This should be initialized at start up, not with every request.
+    let proxy_profile_matcher = ProxyProfileMatcher::new();
+    match proxy_profile_matcher.get_matching_profile(&request) {
+        Some(proxy_profile) => {
+            // Assuming secure connection.
+            // TODO: This should be initialized at start up not with every request.
+            let https = HttpsConnector::new();
+            let client = Client::builder().build::<_, SdkBody>(https);
 
-    // TODO: Make this configurable.
-    let host = "orbital-rust-registry.s3.amazonaws.com";
-    let url = hyper::Uri::builder()
-        .scheme(Scheme::HTTPS)
-        .authority(Authority::from_static(host))
-        .path_and_query(get_path_and_query(path_and_query))
-        .build();
+            let path_and_query = request.uri().path_and_query().unwrap();
+            let destination_host = proxy_profile.destination_host.clone();
+            let url = hyper::Uri::builder()
+                .scheme(Scheme::HTTPS)
+                .authority(destination_host.clone().as_str())
+                .path_and_query(path_and_query.clone())
+                .build();
 
-    let mut new_request_builder = Request::builder()
-        .method(request.method())
-        .uri(url.unwrap());
+            let mut new_request_builder = Request::builder()
+                .method(request.method())
+                .uri(url.unwrap());
 
-    // Pass on the headers
-    let mut other_headers = HashMap::new();
-    for (name, value) in request.headers() {
-        if name.as_str() == "host" {
-            new_request_builder = new_request_builder.header(name, host);
-        } else if name.as_str() == "x-amz-content-sha256" || name.as_str() == "x-amz-date" {
-            new_request_builder = new_request_builder.header(name, value);
-        } else {
-            // Track other headers and add them back after signing so as not to break the signing
-            // process. If we include these when signing, requests that are made are rejected because
-            // the produced signatures don't match.
-            other_headers.insert(name.clone(), value.clone());
+            // Pass on the headers
+            let mut other_headers = HashMap::new();
+            for (name, value) in request.headers() {
+                if name.as_str() == "host" {
+                    new_request_builder = new_request_builder.header(name, destination_host.as_str());
+                } else if name.as_str() == "x-amz-content-sha256" || name.as_str() == "x-amz-date" {
+                    new_request_builder = new_request_builder.header(name, value);
+                } else {
+                    // Track other headers and add them back after signing so as not to break the signing
+                    // process. If we include these when signing, requests that are made are rejected because
+                    // the produced signatures don't match.
+                    other_headers.insert(name.clone(), value.clone());
+                }
+            }
+
+            // https://users.rust-lang.org/t/read-hyper-body-without-modification-to-it/45446/6
+            let mut original_body = request.into_body();
+            let buffer = body_to_bytes(&mut original_body).await;
+
+            println!("Body length: {}", buffer.len());
+            // Sign the request.
+            // https://docs.rs/aws-sig-auth/latest/aws_sig_auth/
+            let sdk_body = if buffer.is_empty() {
+                SdkBody::empty()
+            } else {
+                SdkBody::from(buffer)
+            };
+            let mut new_request = new_request_builder.body(sdk_body).unwrap();
+
+            println!("Updated Request:");
+            log_request(&new_request);
+            sign_request(&mut new_request, &proxy_profile).await.unwrap();
+
+            for (name, value) in other_headers {
+                new_request.headers_mut().insert(name, value);
+            }
+
+            println!("Signed Request:");
+            log_request(&new_request);
+            println!();
+
+            let mut response = client.request(new_request).await;
+            log_response(&mut response).await;
+            response
+        },
+        None => {
+            // Return a 404
+            let mut not_found = Response::default();
+            *not_found.status_mut() = StatusCode::NOT_FOUND;
+            Ok(not_found)
         }
     }
-
-    // https://users.rust-lang.org/t/read-hyper-body-without-modification-to-it/45446/6
-    let mut original_body = request.into_body();
-    let buffer = body_to_bytes(&mut original_body).await;
-
-    println!("Body length: {}", buffer.len());
-    // Sign the request.
-    // https://docs.rs/aws-sig-auth/latest/aws_sig_auth/
-    let sdk_body = if buffer.is_empty() {
-        SdkBody::empty()
-    } else {
-        SdkBody::from(buffer)
-    };
-    let mut new_request = new_request_builder.body(sdk_body).unwrap();
-
-    println!("Updated Request:");
-    log_request(&new_request);
-    sign_request(&mut new_request).await.unwrap();
-
-    for (name, value) in other_headers {
-        new_request.headers_mut().insert(name, value);
-    }
-
-    println!("Signed Request:");
-    log_request(&new_request);
-    println!();
-
-    let mut response = client.request(new_request).await;
-    log_response(&mut response).await;
-    response
 }
 
 async fn body_to_bytes(body: &mut Body) -> Bytes {
@@ -99,13 +163,19 @@ async fn body_to_bytes(body: &mut Body) -> Bytes {
     buf.freeze()
 }
 
-async fn sign_request(request: &mut Request<SdkBody>) -> Result<Signature, SigningError> {
-    // Get credentials.
+async fn credentials() -> aws_types::credentials::Result {
     // TODO: Customize this.
     let credentials_provider = ProfileFileCredentialsProvider::builder()
         .profile_name("orbitalCode")
         .build();
-    let credentials = credentials_provider.provide_credentials().await?;
+    return credentials_provider.provide_credentials().await
+}
+
+async fn sign_request(request: &mut Request<SdkBody>, proxy_profile: &ProxyProfile) -> Result<Signature, SigningError> {
+    // EXPERIMENTAL AND SHOULD BE REFACTORED.
+
+    // EXPERIMENTAL AND SHOULD BE REFACTORED.
+    let credentials = credentials().await.unwrap();
     let signer = signer::SigV4Signer::new();
     let mut operation_config = OperationSigningConfig::default_config();
     operation_config.signature_type = HttpSignatureType::HttpRequestHeaders;
@@ -113,10 +183,11 @@ async fn sign_request(request: &mut Request<SdkBody>) -> Result<Signature, Signi
     operation_config.signing_requirements = SigningRequirements::Required;
     operation_config.expires_in = Some(Duration::from_secs(15 * 60));
     operation_config.algorithm = SigningAlgorithm::SigV4;
+
     let request_config = RequestConfig {
         request_ts: SystemTime::now(),
         region: &SigningRegion::from_static("us-west-2"),
-        service: &SigningService::from_static("s3"),
+        service: &proxy_profile.destination_service,
         payload_override: None,
     };
 

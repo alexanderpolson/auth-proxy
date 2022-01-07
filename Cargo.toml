@@ -18,3 +18,4 @@ hyper = { version = "0.14", features = ["full"] }
 pretty_env_logger = "0.4"
 regex = "1.5.4"
 tokio = { version = "1", features = ["full"] }
+yaml-rust = "0.4.5"

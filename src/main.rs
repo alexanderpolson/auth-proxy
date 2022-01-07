@@ -1,12 +1,16 @@
+extern crate yaml_rust;
+mod proxy_profile;
+
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_sig_auth::middleware::Signature;
 use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError, SigningRequirements, SigningAlgorithm};
 use aws_smithy_http::body::SdkBody;
-use aws_types::SigningService;
 use aws_types::credentials::ProvideCredentials;
 use aws_types::region::SigningRegion;
 
 use bytes::BytesMut;
+
+use http::StatusCode;
 
 use http_body::Body as HttpBody;
 
@@ -16,60 +20,53 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper_tls::HttpsConnector;
 use hyper::body::Bytes;
 
-use regex::Regex;
-
+use std::env;
+use std::fmt;
+use std::fs;
 use std::collections::HashMap;
+use std::error::Error;
 use std::time::{Duration, SystemTime};
-use http::StatusCode;
+use yaml_rust::{YamlEmitter, YamlLoader};
 
-struct ProxyProfile {
-    path_pattern: Regex,
-    destination_host: String,
-    destination_service: SigningService
-}
+use proxy_profile::{ProxyProfile, ProxyProfileResult, ProxyProfileRule};
 
-struct ProxyProfileMatcher {
-    proxy_profiles: Vec<ProxyProfile>
-}
+#[derive(Debug, Clone)]
+struct ArgumentError;
 
-// TODO: Add all supported services here.
-const SUPPORTED_SERVICES: [&'static str; 1] = ["s3"];
-
-// This is necessary because creating a SigningService requires a &'static str.
-fn signing_service(service_name: &str) -> Option<SigningService> {
-    for supported_service in SUPPORTED_SERVICES {
-        if service_name == supported_service {
-            return Some(SigningService::from_static(supported_service));
-        }
+impl fmt::Display for ArgumentError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Need to provide path to proxy profile as an argument")
     }
-    None
 }
 
-impl ProxyProfileMatcher {
-    fn new() -> ProxyProfileMatcher {
-        // TODO: Load these dynamically
-
-        ProxyProfileMatcher {
-            proxy_profiles: vec![ProxyProfile {
-                path_pattern: Regex::new(r"^/api/v1/crates/.+").unwrap(),
-                destination_host: String::from("orbital-rust-registry.s3.amazonaws.com"),
-                destination_service: signing_service("s3").unwrap(),
-            }]
-        }
+impl std::error::Error for ArgumentError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
     }
+}
 
-    fn get_matching_profile(self, request: &Request<Body>) -> Option<ProxyProfile> {
-        let path_and_query = request.uri().path_and_query();
-        match path_and_query {
-            Some(path_and_query) => {
-                for proxy_profile in self.proxy_profiles {
-                    if proxy_profile.path_pattern.is_match(path_and_query.path()) {
-                        return Some(proxy_profile);
-                    }
-                }
-                None
-            },
-            None => None
+fn get_proxy_profile() -> ProxyProfileResult {
+    // TODO: Load these dynamically
+    let args: Vec<String> = env::args().collect();
+    match args.len() {
+        // 0: Executable name
+        // 1: Profile file
+        2 => {
+            println!("Args received");
+            let profile_file = args.get(1).unwrap();
+            let profile_yaml_source = fs::read_to_string(profile_file).unwrap();
+            println!("YAML Source: {}", profile_yaml_source);
+            let profile_yaml =
+                &YamlLoader::load_from_str(profile_yaml_source.as_str()).unwrap()[0];
+            let mut out_str = String::new();
+            let mut emitter = YamlEmitter::new(&mut out_str);
+            emitter.dump(profile_yaml).unwrap();
+            println!("YAML Document: {}", out_str);
+            Ok(ProxyProfile::new())
+        },
+        _ => {
+            println!("No args received");
+            Err(Box::new(ArgumentError))
         }
     }
 }
@@ -81,8 +78,9 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     println!();
 
     // TODO: This should be initialized at start up, not with every request.
-    let proxy_profile_matcher = ProxyProfileMatcher::new();
-    match proxy_profile_matcher.get_matching_profile(&request) {
+    // TODO: Load these dynamically
+    let proxy_profile = get_proxy_profile().unwrap();
+    match proxy_profile.matching_rule(&request) {
         Some(proxy_profile) => {
             // Assuming secure connection.
             // TODO: This should be initialized at start up not with every request.
@@ -171,10 +169,7 @@ async fn credentials() -> aws_types::credentials::Result {
     return credentials_provider.provide_credentials().await
 }
 
-async fn sign_request(request: &mut Request<SdkBody>, proxy_profile: &ProxyProfile) -> Result<Signature, SigningError> {
-    // EXPERIMENTAL AND SHOULD BE REFACTORED.
-
-    // EXPERIMENTAL AND SHOULD BE REFACTORED.
+async fn sign_request(request: &mut Request<SdkBody>, proxy_profile: &ProxyProfileRule) -> Result<Signature, SigningError> {
     let credentials = credentials().await.unwrap();
     let signer = signer::SigV4Signer::new();
     let mut operation_config = OperationSigningConfig::default_config();
@@ -216,6 +211,7 @@ async fn log_response(result: &mut Result<Response<Body>, hyper::Error>) {
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pretty_env_logger::init();
+    get_proxy_profile();
 
     // For every connection, we must make a `Service` to handle all
     // incoming HTTP requests on said connection.

@@ -24,6 +24,7 @@ use std::env;
 use std::fs;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
+use aws_types::Credentials;
 use yaml_rust::YamlLoader;
 
 use proxy_profile::{ArgumentError, ProxyProfile, ProxyProfileResult, ProxyProfileRule};
@@ -59,15 +60,16 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     // TODO: This should be initialized at start up, not with every request.
     // TODO: Load these dynamically
     let proxy_profile = get_proxy_profile().unwrap();
+    let credentials = credentials(&proxy_profile).await.unwrap();
     match proxy_profile.matching_rule(&request) {
-        Some(proxy_profile) => {
+        Some(proxy_profile_rule) => {
             // Assuming secure connection.
             // TODO: This should be initialized at start up not with every request.
             let https = HttpsConnector::new();
             let client = Client::builder().build::<_, SdkBody>(https);
 
             let path_and_query = request.uri().path_and_query().unwrap();
-            let destination_host = proxy_profile.destination_host.clone();
+            let destination_host = proxy_profile_rule.destination_host.clone();
             let url = hyper::Uri::builder()
                 .scheme(Scheme::HTTPS)
                 .authority(destination_host.clone().as_str())
@@ -109,7 +111,7 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
 
             println!("Updated Request:");
             log_request(&new_request);
-            sign_request(&mut new_request, &proxy_profile).await.unwrap();
+            sign_request(&mut new_request, &credentials, &proxy_profile_rule).await.unwrap();
 
             for (name, value) in other_headers {
                 new_request.headers_mut().insert(name, value);
@@ -122,7 +124,7 @@ async fn hello(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
             let mut response = client.request(new_request).await;
             log_response(&mut response).await;
             response
-        },
+        }
         None => {
             // Return a 404
             let mut not_found = Response::default();
@@ -140,16 +142,14 @@ async fn body_to_bytes(body: &mut Body) -> Bytes {
     buf.freeze()
 }
 
-async fn credentials() -> aws_types::credentials::Result {
-    // TODO: Customize this.
+async fn credentials(proxy_profile: &ProxyProfile) -> aws_types::credentials::Result {
     let credentials_provider = ProfileFileCredentialsProvider::builder()
-        .profile_name("orbitalCode")
+        .profile_name(proxy_profile.aws_profile.as_str())
         .build();
     return credentials_provider.provide_credentials().await
 }
 
-async fn sign_request(request: &mut Request<SdkBody>, proxy_profile: &ProxyProfileRule) -> Result<Signature, SigningError> {
-    let credentials = credentials().await.unwrap();
+async fn sign_request(request: &mut Request<SdkBody>, credentials: &Credentials, proxy_profile: &ProxyProfileRule) -> Result<Signature, SigningError> {
     let signer = signer::SigV4Signer::new();
     let mut operation_config = OperationSigningConfig::default_config();
     operation_config.signature_type = HttpSignatureType::HttpRequestHeaders;

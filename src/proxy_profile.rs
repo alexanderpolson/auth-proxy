@@ -32,16 +32,21 @@ pub struct ProxyProfileRule {
 }
 
 pub struct ProxyProfile {
+    pub aws_profile: String,
     proxy_profiles: Vec<ProxyProfileRule>
 }
 
 impl ProxyProfile {
     pub fn new(profile_yaml: &Yaml) -> ProxyProfileResult {
-        match &profile_yaml.as_vec() {
+        let mut aws_profile = String::new();
+        aws_profile.push_str(&profile_yaml["aws_profile"].as_str().unwrap());
+        let profile_rules = &profile_yaml["rules"].as_vec();
+        match profile_rules {
             Some(profile_rules) => {
                 let rules =
                     profile_rules.iter().map(|rule_yaml| rule_for_yaml(rule_yaml).unwrap()).collect();
                 Ok(ProxyProfile {
+                    aws_profile: aws_profile,
                     proxy_profiles: rules
                 })
             },

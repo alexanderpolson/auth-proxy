@@ -29,6 +29,10 @@ use yaml_rust::YamlLoader;
 
 use proxy_profile::{ArgumentError, ProxyProfile, ProxyProfileResult, ProxyProfileRule};
 
+struct ProxyServer {
+
+}
+
 fn get_proxy_profile() -> ProxyProfileResult {
     // TODO: Load these dynamically
     let args: Vec<String> = env::args().collect();
@@ -102,11 +106,7 @@ async fn proxy(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
             println!("Body length: {}", buffer.len());
             // Sign the request.
             // https://docs.rs/aws-sig-auth/latest/aws_sig_auth/
-            let sdk_body = if buffer.is_empty() {
-                SdkBody::empty()
-            } else {
-                SdkBody::from(buffer)
-            };
+            let sdk_body = SdkBody::from(buffer);
             let mut new_request = new_request_builder.body(sdk_body).unwrap();
 
             println!("Updated Request:");

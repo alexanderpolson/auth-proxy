@@ -21,29 +21,12 @@ use hyper_tls::HttpsConnector;
 use hyper::body::Bytes;
 
 use std::env;
-use std::fmt;
 use std::fs;
 use std::collections::HashMap;
-use std::error::Error;
 use std::time::{Duration, SystemTime};
-use yaml_rust::{YamlEmitter, YamlLoader};
+use yaml_rust::YamlLoader;
 
-use proxy_profile::{ProxyProfile, ProxyProfileResult, ProxyProfileRule};
-
-#[derive(Debug, Clone)]
-struct ArgumentError;
-
-impl fmt::Display for ArgumentError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Need to provide path to proxy profile as an argument")
-    }
-}
-
-impl std::error::Error for ArgumentError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        None
-    }
-}
+use proxy_profile::{ArgumentError, ProxyProfile, ProxyProfileResult, ProxyProfileRule};
 
 fn get_proxy_profile() -> ProxyProfileResult {
     // TODO: Load these dynamically
@@ -58,14 +41,10 @@ fn get_proxy_profile() -> ProxyProfileResult {
             println!("YAML Source: {}", profile_yaml_source);
             let profile_yaml =
                 &YamlLoader::load_from_str(profile_yaml_source.as_str()).unwrap()[0];
-            let mut out_str = String::new();
-            let mut emitter = YamlEmitter::new(&mut out_str);
-            emitter.dump(profile_yaml).unwrap();
-            println!("YAML Document: {}", out_str);
-            Ok(ProxyProfile::new())
+
+            ProxyProfile::new(&profile_yaml)
         },
         _ => {
-            println!("No args received");
             Err(Box::new(ArgumentError))
         }
     }
@@ -211,7 +190,6 @@ async fn log_response(result: &mut Result<Response<Body>, hyper::Error>) {
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pretty_env_logger::init();
-    get_proxy_profile();
 
     // For every connection, we must make a `Service` to handle all
     // incoming HTTP requests on said connection.

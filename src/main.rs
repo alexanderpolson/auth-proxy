@@ -29,10 +29,6 @@ use yaml_rust::YamlLoader;
 
 use proxy_profile::{ArgumentError, ProxyProfile, ProxyProfileResult, ProxyProfileRule};
 
-struct ProxyServer {
-
-}
-
 fn get_proxy_profile() -> ProxyProfileResult {
     // TODO: Load these dynamically
     let args: Vec<String> = env::args().collect();

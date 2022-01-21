@@ -1,5 +1,8 @@
 [package]
 name = "auth-proxy"
+homepage = "https://github.com/alexanderpolson/auth-proxy"
+repository  = "https://github.com/alexanderpolson/auth-proxy"
+documentation = "https://github.com/alexanderpolson/auth-proxy"
 description = "Provides a local server that you can point command-line tools to when those commands require, but don't provide an authentication mechanism. For example, if you want to access a secure S3 bucket via a simple curl command, you wouldn't be able to do so without the request being authenticated in somewhere."
 license = "MIT"
 version = "0.0.1"

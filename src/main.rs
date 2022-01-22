@@ -1,7 +1,6 @@
 extern crate yaml_rust;
 mod proxy_profile;
 
-use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_sig_auth::middleware::Signature;
 use aws_sig_auth::signer::{self, OperationSigningConfig, HttpSignatureType, RequestConfig, SigningError, SigningRequirements, SigningAlgorithm};
 use aws_smithy_http::body::SdkBody;
@@ -24,6 +23,7 @@ use std::env;
 use std::fs;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_types::Credentials;
 use yaml_rust::YamlLoader;
 
@@ -139,9 +139,10 @@ async fn body_to_bytes(body: &mut Body) -> Bytes {
 }
 
 async fn credentials(proxy_profile: &ProxyProfile) -> aws_types::credentials::Result {
-    let credentials_provider = ProfileFileCredentialsProvider::builder()
-        .profile_name(proxy_profile.aws_profile.as_str())
-        .build();
+    let credentials_provider = match proxy_profile.aws_profile.clone() {
+        Some(profile_name) => DefaultCredentialsChain::builder().profile_name(profile_name.as_str()).build(),
+        None => DefaultCredentialsChain::builder().build()
+    }.await;
     return credentials_provider.provide_credentials().await
 }
 

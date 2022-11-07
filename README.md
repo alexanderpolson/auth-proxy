@@ -4,7 +4,7 @@
 Assuming you're authorized to access the bucket, you can configure auth-proxy with your desired AWS profile and request patterns, and then make the curl request to the local service, which will intercept the request, add appropriate authorization, and then "forward" the request on to the configured endpoint.
 
 ## Why?
-This tool was originally written with private [Rust registries](https://doc.rust-lang.org/cargo/reference/registries.html) in mind. As of v1 of the registry spec, there is a simple authentication method that allows you to control access to a registry's index, but that same mechanism doesn't apply to downloading thea ctual crates (source code).
+This tool was originally written with private [Rust registries](https://doc.rust-lang.org/cargo/reference/registries.html) in mind. As of v1 of the registry spec, there is a simple authentication method that allows you to control access to a registry's index, but that same mechanism doesn't apply to downloading the actual crates (source code).
 
 I wanted to create a mechanism with which I could control access to a private Rust registry via AWS IAM, and keep certain Rust-based projects for private use only.
 
@@ -18,11 +18,9 @@ I wanted to create a mechanism with which I could control access to a private Ru
 * Always authenticates with us-west-2 AWS region. Need to make this customizable in the profiles.
 * Better error and help messaging. Currently, if some input is incorrect, auth-proxy just panics.
 * Ability to run as a one off. Currently, auth-proxy will run until manually killed. to be able to pass a command to auth-proxy on the command-line and have it exit when done would be nice.
-* Distribute a Docker image that runs auth-proxy indefiitely.
+* Distribute a Docker image that runs auth-proxy indefinitely.
 * Implement other auth mechanisms?
-* If an AWS profile name isn't specified in the proxy profile, assume that the "default" profile should be used. 
-* Add more supported services. 
-* Allow proxy rules to replace more than just host name.
+* Add more supported services, or better yet, remove the need to define specific services in the codebase. 
 * Make the port auth-proxy runs on customizable.
 
 ## How to Use
@@ -59,9 +57,11 @@ aws_profile: code
 rules:
   -
     # The regular expression to match the requested path.
-    path_pattern: "^/api/v1/crates/.+"
+    path_pattern: "^/prefix/more/path/(.+)"
     # The new host name to route matching requests to.
-    destination_host: some-s3-bucket.s3.amazonaws.com
+    proxy_host: some-s3-bucket.s3.amazonaws.com
+    #
+    proxy_request_path_and_query: /another/path/$1
     # The service name to use when signing the request.
     destination_service: s3
 ```
@@ -73,8 +73,8 @@ Once your profile is created, you can then run it via:
 
 ...at which point, it will start listening on port 8123. To verify it works as expected, you can make an example request, in this case pulling a file from a secured bucket that the desired AWS profile has access to:
 
-``curl https://localhost:8123/path/to/file.txt``
+``curl https://localhost:8123/prefix/more/path/sub/path/file.txt``
 
 ...which will be rerouted to the following URL after being properly signed.
 
-``https://some-s3-bucket.s3.amazonaws.com/path/to/file.txt``
+``https://some-s3-bucket.s3.amazonaws.com/another/path/sub/path/file.txt``

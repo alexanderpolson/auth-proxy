@@ -27,7 +27,8 @@ use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_types::Credentials;
 use yaml_rust::YamlLoader;
 
-use proxy_profile::{ArgumentError, ProxyProfile, ProxyProfileResult, ProxyProfileRule};
+use proxy_profile::{ArgumentError, ProxyProfile, ProxyProfileResult};
+use crate::proxy_profile::MatchedProfileRule;
 
 fn get_proxy_profile() -> ProxyProfileResult {
     // TODO: Load these dynamically
@@ -61,7 +62,7 @@ async fn proxy(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     // TODO: Load these dynamically
     let proxy_profile = get_proxy_profile().unwrap();
     let credentials = credentials(&proxy_profile).await.unwrap();
-    match proxy_profile.matching_rule(&request) {
+    match proxy_profile.match_rule_for_request(&request) {
         Some(proxy_profile_rule) => {
             // Assuming secure connection.
             // TODO: This should be initialized at start up not with every request.
@@ -69,7 +70,7 @@ async fn proxy(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
             let client = Client::builder().build::<_, SdkBody>(https);
 
             let path_and_query = request.uri().path_and_query().unwrap();
-            let destination_host = proxy_profile_rule.destination_host.clone();
+            let destination_host = proxy_profile_rule.proxy_host.clone();
             let url = hyper::Uri::builder()
                 .scheme(Scheme::HTTPS)
                 .authority(destination_host.clone().as_str())
@@ -146,7 +147,7 @@ async fn credentials(proxy_profile: &ProxyProfile) -> aws_types::credentials::Re
     return credentials_provider.provide_credentials().await
 }
 
-async fn sign_request(request: &mut Request<SdkBody>, credentials: &Credentials, proxy_profile: &ProxyProfileRule) -> Result<Signature, SigningError> {
+async fn sign_request(request: &mut Request<SdkBody>, credentials: &Credentials, matched_profile_rule: &MatchedProfileRule) -> Result<Signature, SigningError> {
     let signer = signer::SigV4Signer::new();
     let mut operation_config = OperationSigningConfig::default_config();
     operation_config.signature_type = HttpSignatureType::HttpRequestHeaders;
@@ -158,7 +159,7 @@ async fn sign_request(request: &mut Request<SdkBody>, credentials: &Credentials,
     let request_config = RequestConfig {
         request_ts: SystemTime::now(),
         region: &SigningRegion::from_static("us-west-2"),
-        service: &proxy_profile.destination_service,
+        service: &matched_profile_rule.request_service,
         payload_override: None,
     };
 

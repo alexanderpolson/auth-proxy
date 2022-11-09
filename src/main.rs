@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_types::Credentials;
+use http::uri::PathAndQuery;
 use yaml_rust::YamlLoader;
 
 use proxy_profile::{ArgumentError, ProxyProfile, ProxyProfileResult};
@@ -69,66 +70,73 @@ async fn proxy(request: Request<Body>) -> Result<Response<Body>, hyper::Error> {
             let https = HttpsConnector::new();
             let client = Client::builder().build::<_, SdkBody>(https);
 
-            let path_and_query = request.uri().path_and_query().unwrap();
             let destination_host = proxy_profile_rule.proxy_host.clone();
-            let url = hyper::Uri::builder()
-                .scheme(Scheme::HTTPS)
-                .authority(destination_host.clone().as_str())
-                .path_and_query(path_and_query.clone())
-                .build();
+            if let Ok(new_path_and_query) = PathAndQuery::try_from(&proxy_profile_rule.resolved_path_and_query) {
+                let url = hyper::Uri::builder()
+                    .scheme(Scheme::HTTPS)
+                    .authority(destination_host.clone().as_str())
+                    .path_and_query(new_path_and_query)
+                    .build();
 
-            let mut new_request_builder = Request::builder()
-                .method(request.method())
-                .uri(url.unwrap());
+                let mut new_request_builder = Request::builder()
+                    .method(request.method())
+                    .uri(url.unwrap());
 
-            // Pass on the headers
-            let mut other_headers = HashMap::new();
-            for (name, value) in request.headers() {
-                if name.as_str() == "host" {
-                    new_request_builder = new_request_builder.header(name, destination_host.as_str());
-                } else if name.as_str() == "x-amz-content-sha256" || name.as_str() == "x-amz-date" {
-                    new_request_builder = new_request_builder.header(name, value);
-                } else {
-                    // Track other headers and add them back after signing so as not to break the signing
-                    // process. If we include these when signing, requests that are made are rejected because
-                    // the produced signatures don't match.
-                    other_headers.insert(name.clone(), value.clone());
+                // Pass on the headers
+                let mut other_headers = HashMap::new();
+                for (name, value) in request.headers() {
+                    if name.as_str() == "host" {
+                        new_request_builder = new_request_builder.header(name, destination_host.as_str());
+                    } else if name.as_str() == "x-amz-content-sha256" || name.as_str() == "x-amz-date" {
+                        new_request_builder = new_request_builder.header(name, value);
+                    } else {
+                        // Track other headers and add them back after signing so as not to break the signing
+                        // process. If we include these when signing, requests that are made are rejected because
+                        // the produced signatures don't match.
+                        other_headers.insert(name.clone(), value.clone());
+                    }
                 }
+
+                // https://users.rust-lang.org/t/read-hyper-body-without-modification-to-it/45446/6
+                let mut original_body = request.into_body();
+                let buffer = body_to_bytes(&mut original_body).await;
+
+                println!("Body length: {}", buffer.len());
+                // Sign the request.
+                // https://docs.rs/aws-sig-auth/latest/aws_sig_auth/
+                let sdk_body = SdkBody::from(buffer);
+                let mut new_request = new_request_builder.body(sdk_body).unwrap();
+
+                println!("Updated Request:");
+                log_request(&new_request);
+                sign_request(&mut new_request, &credentials, &proxy_profile_rule).await.unwrap();
+
+                for (name, value) in other_headers {
+                    new_request.headers_mut().insert(name, value);
+                }
+
+                println!("Signed Request:");
+                log_request(&new_request);
+                println!();
+
+                let mut response = client.request(new_request).await;
+                log_response(&mut response).await;
+                response
+            } else {
+                Ok(not_found())
             }
-
-            // https://users.rust-lang.org/t/read-hyper-body-without-modification-to-it/45446/6
-            let mut original_body = request.into_body();
-            let buffer = body_to_bytes(&mut original_body).await;
-
-            println!("Body length: {}", buffer.len());
-            // Sign the request.
-            // https://docs.rs/aws-sig-auth/latest/aws_sig_auth/
-            let sdk_body = SdkBody::from(buffer);
-            let mut new_request = new_request_builder.body(sdk_body).unwrap();
-
-            println!("Updated Request:");
-            log_request(&new_request);
-            sign_request(&mut new_request, &credentials, &proxy_profile_rule).await.unwrap();
-
-            for (name, value) in other_headers {
-                new_request.headers_mut().insert(name, value);
-            }
-
-            println!("Signed Request:");
-            log_request(&new_request);
-            println!();
-
-            let mut response = client.request(new_request).await;
-            log_response(&mut response).await;
-            response
         }
         None => {
-            // Return a 404
-            let mut not_found = Response::default();
-            *not_found.status_mut() = StatusCode::NOT_FOUND;
-            Ok(not_found)
+            Ok(not_found())
         }
     }
+}
+
+fn not_found() -> Response<Body> {
+    // Return a 404
+    let mut not_found = Response::default();
+    *not_found.status_mut() = StatusCode::NOT_FOUND;
+    not_found
 }
 
 async fn body_to_bytes(body: &mut Body) -> Bytes {
